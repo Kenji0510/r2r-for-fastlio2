@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use async_std::stream::StreamExt;
 use futures::{executor::LocalPool, task::LocalSpawnExt};
 use r2r::{sensor_msgs::msg::PointCloud2, QosProfile};
+use r2r_for_fastlio2::operate_pcd::{save_to_pcd, PointXYZ};
+
+const POINTS_VEC_CAPACITY: usize = 30000;
+const SAVE_DIR: &str = "data/output";
 
 fn main() -> Result<()>{
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
@@ -17,13 +21,30 @@ fn main() -> Result<()>{
 
     log::info!("Starting subscriber for /cloud_registered and /Laser_map");
 
+    // Subscriber for /cloud_registered
     spawner.spawn_local(async move {
         let mut msg_count: i32 = 0;
+
         loop {
             match subsc_cr.next().await {
                 Some(message) => {
+                    let points_num = (message.width * message.height) as usize;
                     log::debug!("{}: Received cloud_registered message", msg_count);
-                    log::debug!("/cloud_registered points: {}", message.width * message.height);
+                    log::debug!("/cloud_registered points: {}", points_num);
+
+                    let points = match parse_livox_pointcloud2(&message) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::error!("Failed to parse PointCloud2 message: {}", e);
+                            continue;
+                        }
+                    };
+                    
+                    let filename = format!("livox-lidar/cloud_registered_{}.pcd", msg_count);
+                    match save_to_pcd(&points, SAVE_DIR, &filename) {
+                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                        Err(e) => log::error!("Failed to save PCD file: {}", e),
+                    }
                 }
                 None => break,
             }
@@ -37,4 +58,25 @@ fn main() -> Result<()>{
     }
 
     // Ok(())
+}
+
+fn parse_livox_pointcloud2(cloud: &PointCloud2) -> Result<Vec<PointXYZ>> {
+    let points_num = (cloud.width * cloud.height) as usize;
+    let point_step = cloud.point_step as usize;
+    let mut points = Vec::with_capacity(points_num);
+
+    for i in 0..points_num {
+        let offset = i * point_step;
+
+        if offset + point_step <= cloud.data.len() {
+            let p = PointXYZ {
+                x: f32::from_le_bytes(cloud.data[offset..offset + 4].try_into().unwrap()),
+                y: f32::from_le_bytes(cloud.data[offset + 4..offset + 8].try_into().unwrap()),
+                z: f32::from_le_bytes(cloud.data[offset + 8..offset + 12].try_into().unwrap()),
+            };
+            points.push(p);
+        }
+    }
+
+    Ok(points)
 }
