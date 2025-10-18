@@ -4,7 +4,6 @@ use futures::{executor::LocalPool, task::LocalSpawnExt};
 use r2r::{sensor_msgs::msg::PointCloud2, QosProfile};
 use r2r_for_fastlio2::operate_pcd::{save_to_pcd, PointXYZ};
 
-const POINTS_VEC_CAPACITY: usize = 30000;
 const SAVE_DIR: &str = "data/output";
 
 fn main() -> Result<()>{
@@ -13,13 +12,14 @@ fn main() -> Result<()>{
 
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "subscriber_fastlio2", "")?;
-    let mut subsc_cr = node.subscribe::<PointCloud2>("/livox/lidar_3JEDL9M001C1691", QosProfile::default())?;
-    // let mut subsc_lm = node.subscribe::<PointCloud2>("", QosProfile::default())?;
+    let mut subsc_cr = node.subscribe::<PointCloud2>("/cloud_registered", QosProfile::default())?;
+    let mut subsc_lm = node.subscribe::<PointCloud2>("/Laser_map", QosProfile::default())?;
+    let mut subsc_avia = node.subscribe::<PointCloud2>("/livox/lidar_3JEDL9M001C1691", QosProfile::default())?;
 
     let mut pool = LocalPool::new();
     let spawner= pool.spawner();
 
-    log::info!("Starting subscriber for /cloud_registered and /Laser_map");
+    log::info!("Starting subscriber for /cloud_registered, /Laser_map and /livox/lidar_3JEDL9M001C1691");
 
     // Subscriber for /cloud_registered
     spawner.spawn_local(async move {
@@ -40,7 +40,78 @@ fn main() -> Result<()>{
                         }
                     };
                     
-                    let filename = format!("livox-lidar/cloud_registered_{}.pcd", msg_count);
+                    let filename = format!("fastlio2/cr/cloud_registered_{}.pcd", msg_count);
+                    match save_to_pcd(&points, SAVE_DIR, &filename) {
+                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                        Err(e) => log::error!("Failed to save PCD file: {}", e),
+                    }
+                }
+                None => break,
+            }
+            msg_count += 1;
+        }
+    }).context("Failed to spawn local task")?;
+
+    // Subscriber for /Laser_map
+    spawner.spawn_local(async move {
+        let mut msg_count: i32 = 0;
+        let mut points_num_prev: usize = 0;
+
+        loop {
+            match subsc_lm.next().await {
+                Some(message) => {
+                    log::debug!("{}: Received Laser_map message", msg_count);
+
+                    let points_num = (message.width * message.height) as usize;
+                    points_num_prev = points_num;
+                    
+                    log::debug!("/Laser_map points: {}", points_num);
+                    if msg_count % 5 != 0 && points_num <= points_num_prev {
+                        log::debug!("Skipping saving Laser_map message at count {}", msg_count);
+                        msg_count += 1;
+                        continue;
+                    }
+
+                    let points = match parse_livox_pointcloud2(&message) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::error!("Failed to parse PointCloud2 message: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let filename = format!("fastlio2/lm/Laser_map_{}.pcd", msg_count);
+                    match save_to_pcd(&points, SAVE_DIR, &filename) {
+                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                        Err(e) => log::error!("Failed to save PCD file: {}", e),
+                    }
+                }
+                None => break,
+            }
+            msg_count += 1;
+        }
+    }).context("Failed to spawn local task")?;
+
+    // Subscriber for /livox/lidar_3JEDL9M001C1691
+    spawner.spawn_local(async move {
+        let mut msg_count: i32 = 0;
+
+        loop {
+            match subsc_avia.next().await {
+                Some(message) => {
+                    let points_num = (message.width * message.height) as usize;
+                    log::debug!("{}: Received /livox/lidar_3JEDL9M001C1691 message", msg_count);
+                    log::debug!("/livox/lidar_3JEDL9M001C1691 points: {}", points_num);
+
+                    let points = match parse_livox_pointcloud2(&message) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::error!("Failed to parse PointCloud2 message: {}", e);
+                            continue;
+                        }
+                    };
+                    
+                    let filename = format!("livox-lidar/lidar_3JEDL9M001C1691_{}.pcd", msg_count);
                     match save_to_pcd(&points, SAVE_DIR, &filename) {
                         Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
