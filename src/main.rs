@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_std::stream::StreamExt;
 use futures::{executor::LocalPool, task::LocalSpawnExt};
 use r2r::{sensor_msgs::msg::PointCloud2, QosProfile};
-use r2r_for_fastlio2::operate_pcd::{save_to_pcd, PointXYZ};
+use r2r_for_fastlio2::{operate_pcd::{save_to_pcd, PointXYZ}, remove_ceiling::{create_height_maps, extract_min_max_z, remove_noise, HeightStats, RemoveCondition}};
 
 const SAVE_DIR: &str = "data/output";
 
@@ -40,11 +40,26 @@ fn main() -> Result<()>{
                         }
                     };
                     
-                    let filename = format!("fastlio2/cr/cloud_registered_{}.pcd", msg_count);
+                    let mut filename = format!("fastlio2/cr/cloud_registered_{}.pcd", msg_count);
                     match save_to_pcd(&points, SAVE_DIR, &filename) {
                         Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
+
+                    // let grid_size = 0.5;
+                    // let removed_points = match remove_ceiling_points(&points, grid_size) {
+                    //     Ok(p) => p,
+                    //     Err(e) => {
+                    //         log::error!("Failed to remove ceiling points: {}", e);
+                    //         continue;
+                    //     }   
+                    // };
+
+                    // filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
+                    // match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
+                    //     Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                    //     Err(e) => log::error!("Failed to save PCD file: {}", e),
+                    // }
                 }
                 None => break,
             }
@@ -80,8 +95,28 @@ fn main() -> Result<()>{
                         }
                     };
 
-                    let filename = format!("fastlio2/lm/Laser_map_{}.pcd", msg_count);
+                    let mut filename = format!("fastlio2/lm/Laser_map_{}.pcd", msg_count);
                     match save_to_pcd(&points, SAVE_DIR, &filename) {
+                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                        Err(e) => log::error!("Failed to save PCD file: {}", e),
+                    }
+
+                    let start = std::time::Instant::now();
+
+                    let grid_size = 0.5;
+                    let removed_points = match remove_ceiling_points(&points, grid_size) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::error!("Failed to remove ceiling points: {}", e);
+                            continue;
+                        }   
+                    };
+
+                    let elapsed = start.elapsed();
+                    log::debug!("Ceiling removal took: {:.2?} seconds", elapsed);
+
+                    filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
+                    match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
                         Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
@@ -150,4 +185,28 @@ fn parse_livox_pointcloud2(cloud: &PointCloud2) -> Result<Vec<PointXYZ>> {
     }
 
     Ok(points)
+}
+
+fn remove_ceiling_points(points: &[PointXYZ], grid_size: f32) -> Result<Vec<PointXYZ>> {
+    let height_map = create_height_maps(points, grid_size);
+
+    let (min_z, max_z) = extract_min_max_z(&height_map);
+    log::debug!("Global min_z: {}, max_z: {}", min_z, max_z);
+
+    let height_grids = HeightStats {
+        min_z,
+        max_z,
+        height_stats: height_map,
+    };
+
+    // If you want to strict remove noise condition, set higher value (e.g., 0.7~0.9)
+    let remove_cond = RemoveCondition {
+        lower_z_density_threshold: 0.45,  
+        upper_z_density_threshold: 0.6,  // Previously 0.2
+    };
+
+    let removed_noise_points = remove_noise(&height_grids, remove_cond.clone());
+    log::debug!("Points after ceiling removal: {}", removed_noise_points.len());
+
+    Ok(removed_noise_points)
 }
