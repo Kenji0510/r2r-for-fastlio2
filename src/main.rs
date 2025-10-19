@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_std::stream::StreamExt;
 use futures::{executor::LocalPool, task::LocalSpawnExt};
 use r2r::{sensor_msgs::msg::PointCloud2, QosProfile};
-use r2r_for_fastlio2::{operate_pcd::{save_to_pcd, PointXYZ}, remove_ceiling::{create_height_maps, extract_min_max_z, remove_noise, HeightStats, RemoveCondition}};
+use r2r_for_fastlio2::{operate_pcd::{save_to_pcd, PointXYZ}, remove_ceiling::{create_height_maps, extract_min_max_z, remove_noise, HeightStats, RemoveCondition}, voxelization::voxel_downsample};
 
 const SAVE_DIR: &str = "data/output";
 
@@ -32,6 +32,7 @@ fn main() -> Result<()>{
                     log::debug!("{}: Received cloud_registered message", msg_count);
                     log::debug!("/cloud_registered points: {}", points_num);
 
+                    // Convert the data from PointCloud2 message to PointXYZ vector
                     let points = match parse_livox_pointcloud2(&message) {
                         Ok(p) => p,
                         Err(e) => {
@@ -42,6 +43,20 @@ fn main() -> Result<()>{
                     
                     let mut filename = format!("fastlio2/cr/cloud_registered_{}.pcd", msg_count);
                     match save_to_pcd(&points, SAVE_DIR, &filename) {
+                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                        Err(e) => log::error!("Failed to save PCD file: {}", e),
+                    }
+
+                    //  Voxelization
+                    let start_for_downsampling = std::time::Instant::now();
+                    let voxel_size = 0.1;
+                    let downsampled_points = voxel_downsample(&points, voxel_size);
+                    let elapsed_for_downsampling = start_for_downsampling.elapsed();
+                    log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
+                    log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
+
+                    filename = format!("voxeled/cr/downsampled-{}_cloud_registered_{}.pcd", voxel_size, msg_count);
+                    match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
                         Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
@@ -87,6 +102,7 @@ fn main() -> Result<()>{
                         continue;
                     }
 
+                    // Convert the data from PointCloud2 message to PointXYZ vector
                     let points = match parse_livox_pointcloud2(&message) {
                         Ok(p) => p,
                         Err(e) => {
@@ -101,8 +117,8 @@ fn main() -> Result<()>{
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
 
-                    let start = std::time::Instant::now();
-
+                    // Remove ceiling points
+                    let start_for_removing = std::time::Instant::now();
                     let grid_size = 0.5;
                     let removed_points = match remove_ceiling_points(&points, grid_size) {
                         Ok(p) => p,
@@ -111,12 +127,25 @@ fn main() -> Result<()>{
                             continue;
                         }   
                     };
-
-                    let elapsed = start.elapsed();
-                    log::debug!("Ceiling removal took: {:.2?} seconds", elapsed);
+                    let elapsed_for_removing = start_for_removing.elapsed();
+                    log::debug!("Ceiling removal took: {:.2?} seconds", elapsed_for_removing);
 
                     filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
                     match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
+                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                        Err(e) => log::error!("Failed to save PCD file: {}", e),
+                    }
+
+                    //  Voxelization
+                    let start_for_downsampling = std::time::Instant::now();
+                    let voxel_size = 0.1;
+                    let downsampled_points = voxel_downsample(&removed_points, voxel_size);
+                    let elapsed_for_downsampling = start_for_downsampling.elapsed();
+                    log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
+                    log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
+
+                    filename = format!("voxeled/lm/downsampled-{}_laser_map_{}.pcd", voxel_size, msg_count);
+                    match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
                         Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
@@ -138,6 +167,7 @@ fn main() -> Result<()>{
                     log::debug!("{}: Received /livox/lidar_3JEDL9M001C1691 message", msg_count);
                     log::debug!("/livox/lidar_3JEDL9M001C1691 points: {}", points_num);
 
+                    // Convert the data from PointCloud2 message to PointXYZ vector
                     let points = match parse_livox_pointcloud2(&message) {
                         Ok(p) => p,
                         Err(e) => {
@@ -151,6 +181,11 @@ fn main() -> Result<()>{
                         Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
+
+                    //  Voxelization
+                    let voxel_size = 0.1;
+                    let downsampled_points = voxel_downsample(&points, voxel_size);
+                    log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
                 }
                 None => break,
             }
