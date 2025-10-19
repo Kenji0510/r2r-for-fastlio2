@@ -49,7 +49,7 @@ fn main() -> Result<()>{
 
                     //  Voxelization
                     let start_for_downsampling = std::time::Instant::now();
-                    let voxel_size = 0.1;
+                    let voxel_size = 0.01;
                     let downsampled_points = voxel_downsample(&points, voxel_size);
                     let elapsed_for_downsampling = start_for_downsampling.elapsed();
                     log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
@@ -138,7 +138,7 @@ fn main() -> Result<()>{
 
                     //  Voxelization
                     let start_for_downsampling = std::time::Instant::now();
-                    let voxel_size = 0.1;
+                    let voxel_size = 0.2;
                     let downsampled_points = voxel_downsample(&removed_points, voxel_size);
                     let elapsed_for_downsampling = start_for_downsampling.elapsed();
                     log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
