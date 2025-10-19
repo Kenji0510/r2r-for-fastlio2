@@ -1,13 +1,15 @@
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
+
 use anyhow::{Context, Result};
 use async_std::stream::StreamExt;
 use futures::{executor::LocalPool, task::LocalSpawnExt};
 use r2r::{sensor_msgs::msg::PointCloud2, QosProfile};
-use r2r_for_fastlio2::{operate_pcd::{save_to_pcd, PointXYZ}, remove_ceiling::{create_height_maps, extract_min_max_z, remove_noise, HeightStats, RemoveCondition}, voxelization::voxel_downsample};
+use r2r_for_fastlio2::{operate_pcd::{save_to_pcd, PointXYZ}, remove_ceiling::{create_height_maps, extract_min_max_z, remove_noise, HeightStats, RemoveCondition}, types::GottenData, voxelization::voxel_downsample};
 
 const SAVE_DIR: &str = "data/output";
 
 fn main() -> Result<()>{
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .init();
 
     let ctx = r2r::Context::create()?;
@@ -21,6 +23,14 @@ fn main() -> Result<()>{
 
     log::info!("Starting subscriber for /cloud_registered, /Laser_map and /livox/lidar_3JEDL9M001C1691");
 
+    let gotten_data: Arc<GottenData> = Arc::new(GottenData {
+        counter: AtomicUsize::new(0),
+        cr_points: Mutex::new(Vec::new()),
+        lm_points: Mutex::new(Vec::new()),
+        avia_points: Mutex::new(Vec::new()),
+    });
+
+    let gotten_data_cr = Arc::clone(&gotten_data);
     // Subscriber for /cloud_registered
     spawner.spawn_local(async move {
         let mut msg_count: i32 = 0;
@@ -61,6 +71,16 @@ fn main() -> Result<()>{
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
 
+                    {
+                        let counter = gotten_data_cr.counter.fetch_add(1, Ordering::SeqCst);                    
+
+                        let mut cr_points = gotten_data_cr.cr_points.lock().unwrap();
+                        *cr_points = downsampled_points.clone();
+
+                        log::info!("Updated gotten_data counter to {}", counter);
+                        log::info!("Updated gotten_data cr_points to {}", cr_points.len());
+                    }
+
                     // let grid_size = 0.5;
                     // let removed_points = match remove_ceiling_points(&points, grid_size) {
                     //     Ok(p) => p,
@@ -82,6 +102,7 @@ fn main() -> Result<()>{
         }
     }).context("Failed to spawn local task")?;
 
+    let gotten_data_lm = Arc::clone(&gotten_data);
     // Subscriber for /Laser_map
     spawner.spawn_local(async move {
         let mut msg_count: i32 = 0;
@@ -149,6 +170,13 @@ fn main() -> Result<()>{
                         Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                         Err(e) => log::error!("Failed to save PCD file: {}", e),
                     }
+
+                    {
+                        let mut lm_points = gotten_data_lm.lm_points.lock().unwrap();
+                        *lm_points = downsampled_points.clone();
+
+                        log::info!("Updated gotten_data lm_points to {}", lm_points.len());
+                    }
                 }
                 None => break,
             }
@@ -157,6 +185,7 @@ fn main() -> Result<()>{
     }).context("Failed to spawn local task")?;
 
     // Subscriber for /livox/lidar_3JEDL9M001C1691
+    let gotten_data_avia = Arc::clone(&gotten_data);
     spawner.spawn_local(async move {
         let mut msg_count: i32 = 0;
 
@@ -183,9 +212,16 @@ fn main() -> Result<()>{
                     }
 
                     //  Voxelization
-                    let voxel_size = 0.1;
+                    let voxel_size = 0.01;
                     let downsampled_points = voxel_downsample(&points, voxel_size);
                     log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
+
+                    {
+                        let mut avia_points = gotten_data_avia.avia_points.lock().unwrap();
+                        *avia_points = downsampled_points.clone();
+
+                        log::info!("Updated gotten_data avia_points to {}", avia_points.len());
+                    }
                 }
                 None => break,
             }
