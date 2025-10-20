@@ -1,27 +1,18 @@
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
 
 use anyhow::{Context, Result};
-use async_std::stream::StreamExt;
-use futures::{executor::LocalPool, task::LocalSpawnExt};
+use futures::StreamExt; 
+// use futures::{executor::LocalPool, task::LocalSpawnExt};
 use r2r::{sensor_msgs::msg::PointCloud2, QosProfile};
 use r2r_for_fastlio2::{operate_pcd::{save_to_pcd, PointXYZ}, remove_ceiling::{create_height_maps, extract_min_max_z, remove_noise, HeightStats, RemoveCondition}, types::GottenData, voxelization::voxel_downsample};
+use tokio::{sync::broadcast, task};
 
 const SAVE_DIR: &str = "data/output";
 
-fn main() -> Result<()>{
+#[tokio::main]
+async fn main() -> Result<()>{
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .init();
-
-    let ctx = r2r::Context::create()?;
-    let mut node = r2r::Node::create(ctx, "subscriber_fastlio2", "")?;
-    let mut subsc_cr = node.subscribe::<PointCloud2>("/cloud_registered", QosProfile::default())?;
-    let mut subsc_lm = node.subscribe::<PointCloud2>("/Laser_map", QosProfile::default())?;
-    let mut subsc_avia = node.subscribe::<PointCloud2>("/livox/lidar_3JEDL9M001C1691", QosProfile::default())?;
-
-    let mut pool = LocalPool::new();
-    let spawner= pool.spawner();
-
-    log::info!("Starting subscriber for /cloud_registered, /Laser_map and /livox/lidar_3JEDL9M001C1691");
 
     let gotten_data: Arc<GottenData> = Arc::new(GottenData {
         counter: AtomicUsize::new(0),
@@ -30,211 +21,304 @@ fn main() -> Result<()>{
         avia_points: Mutex::new(Vec::new()),
     });
 
+    // Clone the shared data for using in different tokio-threads
+    let gotten_data_for_quic = Arc::clone(&gotten_data);
+    let gotten_data_for_ros = Arc::clone(&gotten_data);
+
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let shutdown_rx = shutdown_tx.subscribe();
+
+    let quic_thread = tokio::spawn(async move {
+        log::info!("Starting quic thread!");
+    });
+
+    // ---- ROS2 サブスク＆spin_once（spawn_blocking）----
+    let spin_handle = tokio::spawn(async move {
+        run_ros_subscribers(gotten_data_for_ros, shutdown_rx).await
+    });
+
+    log::info!("Subscribers and ROS spin loop started. Waiting for Ctrl+C...");
+
+    // 早期終了させない：Ctrl+C か、どちらかのタスクが落ちたら終了
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            log::info!("Shutdown by Ctrl+C");
+            let _ = shutdown_tx.send(());
+        }
+        // res = quic_thread => {
+        //     res.context("QUIC task panicked")?;
+        //     log::warn!("QUIC task finished; shutting down");
+        // }
+        res = spin_handle => {
+            res.context("ROS spin task panicked")??;
+            log::warn!("ROS spin task finished; shutting down");
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_ros_subscribers(gotten_data: Arc<GottenData>, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
+    let ctx = r2r::Context::create()?;
+    let mut node = r2r::Node::create(ctx, "subscriber_fastlio2", "")?;
+    let mut subsc_cr = node.subscribe::<PointCloud2>("/cloud_registered", QosProfile::default())?;
+    let mut subsc_lm = node.subscribe::<PointCloud2>("/Laser_map", QosProfile::default())?;
+    let mut subsc_avia = node.subscribe::<PointCloud2>("/livox/lidar_3JEDL9M001C1691", QosProfile::default())?;
+
+    log::info!("Starting subscriber for /cloud_registered, /Laser_map and /livox/lidar_3JEDL9M001C1691");
+
     let gotten_data_cr = Arc::clone(&gotten_data);
+    let mut shutdown_cr = shutdown.resubscribe();
     // Subscriber for /cloud_registered
-    spawner.spawn_local(async move {
+    let cr_handle = task::spawn(async move {
         let mut msg_count: i32 = 0;
 
         loop {
-            match subsc_cr.next().await {
-                Some(message) => {
-                    let points_num = (message.width * message.height) as usize;
-                    log::debug!("{}: Received cloud_registered message", msg_count);
-                    log::debug!("/cloud_registered points: {}", points_num);
-
-                    // Convert the data from PointCloud2 message to PointXYZ vector
-                    let points = match parse_livox_pointcloud2(&message) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            log::error!("Failed to parse PointCloud2 message: {}", e);
-                            continue;
-                        }
-                    };
-                    
-                    let mut filename = format!("fastlio2/cr/cloud_registered_{}.pcd", msg_count);
-                    match save_to_pcd(&points, SAVE_DIR, &filename) {
-                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                        Err(e) => log::error!("Failed to save PCD file: {}", e),
-                    }
-
-                    //  Voxelization
-                    let start_for_downsampling = std::time::Instant::now();
-                    let voxel_size = 0.01;
-                    let downsampled_points = voxel_downsample(&points, voxel_size);
-                    let elapsed_for_downsampling = start_for_downsampling.elapsed();
-                    log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
-                    log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
-
-                    filename = format!("voxeled/cr/downsampled-{}_cloud_registered_{}.pcd", voxel_size, msg_count);
-                    match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
-                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                        Err(e) => log::error!("Failed to save PCD file: {}", e),
-                    }
-
-                    {
-                        let counter = gotten_data_cr.counter.fetch_add(1, Ordering::SeqCst);                    
-
-                        let mut cr_points = gotten_data_cr.cr_points.lock().unwrap();
-                        *cr_points = downsampled_points.clone();
-
-                        log::info!("Updated gotten_data counter to {}", counter);
-                        log::info!("Updated gotten_data cr_points to {}", cr_points.len());
-                    }
-
-                    // let grid_size = 0.5;
-                    // let removed_points = match remove_ceiling_points(&points, grid_size) {
-                    //     Ok(p) => p,
-                    //     Err(e) => {
-                    //         log::error!("Failed to remove ceiling points: {}", e);
-                    //         continue;
-                    //     }   
-                    // };
-
-                    // filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
-                    // match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
-                    //     Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                    //     Err(e) => log::error!("Failed to save PCD file: {}", e),
-                    // }
+            tokio::select! {
+                _ = shutdown_cr.recv() => {
+                    log::info!("Shutdown signal received in /cloud_registered subscriber");
+                    break;
                 }
-                None => break,
+                msg = subsc_cr.next() =>{
+                    match msg {
+                        Some(message) => {
+                            let points_num = (message.width * message.height) as usize;
+                            log::debug!("{}: Received cloud_registered message", msg_count);
+                            log::debug!("/cloud_registered points: {}", points_num);
+
+                            // Convert the data from PointCloud2 message to PointXYZ vector
+                            let points = match parse_livox_pointcloud2(&message) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::error!("Failed to parse PointCloud2 message: {}", e);
+                                    continue;
+                                }
+                            };
+                            
+                            let mut filename = format!("fastlio2/cr/cloud_registered_{}.pcd", msg_count);
+                            match save_to_pcd(&points, SAVE_DIR, &filename) {
+                                Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                                Err(e) => log::error!("Failed to save PCD file: {}", e),
+                            }
+
+                            //  Voxelization
+                            let start_for_downsampling = std::time::Instant::now();
+                            let voxel_size = 0.01;
+                            let downsampled_points = voxel_downsample(&points, voxel_size);
+                            let elapsed_for_downsampling = start_for_downsampling.elapsed();
+                            log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
+                            log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
+
+                            filename = format!("voxeled/cr/downsampled-{}_cloud_registered_{}.pcd", voxel_size, msg_count);
+                            match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
+                                Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                                Err(e) => log::error!("Failed to save PCD file: {}", e),
+                            }
+
+                            {
+                                let counter = gotten_data_cr.counter.fetch_add(1, Ordering::SeqCst);                    
+
+                                let mut cr_points = gotten_data_cr.cr_points.lock().unwrap();
+                                *cr_points = downsampled_points.clone();
+
+                                log::info!("Updated gotten_data counter to {}", counter);
+                                log::info!("Updated gotten_data cr_points to {}", cr_points.len());
+                            }
+
+                            // let grid_size = 0.5;
+                            // let removed_points = match remove_ceiling_points(&points, grid_size) {
+                            //     Ok(p) => p,
+                            //     Err(e) => {
+                            //         log::error!("Failed to remove ceiling points: {}", e);
+                            //         continue;
+                            //     }   
+                            // };
+
+                            // filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
+                            // match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
+                            //     Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                            //     Err(e) => log::error!("Failed to save PCD file: {}", e),
+                            // }
+                        }
+                        None => break,
+                    }
+                    msg_count += 1;
+                }
             }
-            msg_count += 1;
         }
-    }).context("Failed to spawn local task")?;
+    });
 
     let gotten_data_lm = Arc::clone(&gotten_data);
+    let mut shutdown_lm = shutdown.resubscribe();
     // Subscriber for /Laser_map
-    spawner.spawn_local(async move {
+    let lm_handle = task::spawn(async move {
         let mut msg_count: i32 = 0;
         let mut points_num_prev: usize = 0;
 
         loop {
-            match subsc_lm.next().await {
-                Some(message) => {
-                    log::debug!("{}: Received Laser_map message", msg_count);
-
-                    let points_num = (message.width * message.height) as usize;
-                    points_num_prev = points_num;
-                    
-                    log::debug!("/Laser_map points: {}", points_num);
-                    if msg_count % 5 != 0 && points_num <= points_num_prev {
-                        log::debug!("Skipping saving Laser_map message at count {}", msg_count);
-                        msg_count += 1;
-                        continue;
-                    }
-
-                    // Convert the data from PointCloud2 message to PointXYZ vector
-                    let points = match parse_livox_pointcloud2(&message) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            log::error!("Failed to parse PointCloud2 message: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let mut filename = format!("fastlio2/lm/Laser_map_{}.pcd", msg_count);
-                    match save_to_pcd(&points, SAVE_DIR, &filename) {
-                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                        Err(e) => log::error!("Failed to save PCD file: {}", e),
-                    }
-
-                    // Remove ceiling points
-                    let start_for_removing = std::time::Instant::now();
-                    let grid_size = 0.5;
-                    let removed_points = match remove_ceiling_points(&points, grid_size) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            log::error!("Failed to remove ceiling points: {}", e);
-                            continue;
-                        }   
-                    };
-                    let elapsed_for_removing = start_for_removing.elapsed();
-                    log::debug!("Ceiling removal took: {:.2?} seconds", elapsed_for_removing);
-
-                    filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
-                    match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
-                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                        Err(e) => log::error!("Failed to save PCD file: {}", e),
-                    }
-
-                    //  Voxelization
-                    let start_for_downsampling = std::time::Instant::now();
-                    let voxel_size = 0.2;
-                    let downsampled_points = voxel_downsample(&removed_points, voxel_size);
-                    let elapsed_for_downsampling = start_for_downsampling.elapsed();
-                    log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
-                    log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
-
-                    filename = format!("voxeled/lm/downsampled-{}_laser_map_{}.pcd", voxel_size, msg_count);
-                    match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
-                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                        Err(e) => log::error!("Failed to save PCD file: {}", e),
-                    }
-
-                    {
-                        let mut lm_points = gotten_data_lm.lm_points.lock().unwrap();
-                        *lm_points = downsampled_points.clone();
-
-                        log::info!("Updated gotten_data lm_points to {}", lm_points.len());
-                    }
+            tokio::select! {
+                _ = shutdown_lm.recv() => {
+                    log::info!("LM subscriber shutting down");
+                    break;
                 }
-                None => break,
+                msg = subsc_lm.next() => {
+                    match msg {
+                        Some(message) => {
+                            log::debug!("{}: Received Laser_map message", msg_count);
+
+                            let points_num = (message.width * message.height) as usize;
+                            points_num_prev = points_num;
+                            
+                            log::debug!("/Laser_map points: {}", points_num);
+                            if msg_count % 5 != 0 && points_num <= points_num_prev {
+                                log::debug!("Skipping saving Laser_map message at count {}", msg_count);
+                                msg_count += 1;
+                                continue;
+                            }
+
+                            // Convert the data from PointCloud2 message to PointXYZ vector
+                            let points = match parse_livox_pointcloud2(&message) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::error!("Failed to parse PointCloud2 message: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let mut filename = format!("fastlio2/lm/Laser_map_{}.pcd", msg_count);
+                            match save_to_pcd(&points, SAVE_DIR, &filename) {
+                                Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                                Err(e) => log::error!("Failed to save PCD file: {}", e),
+                            }
+
+                            // Remove ceiling points
+                            let start_for_removing = std::time::Instant::now();
+                            let grid_size = 0.5;
+                            let removed_points = match remove_ceiling_points(&points, grid_size) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::error!("Failed to remove ceiling points: {}", e);
+                                    continue;
+                                }   
+                            };
+                            let elapsed_for_removing = start_for_removing.elapsed();
+                            log::debug!("Ceiling removal took: {:.2?} seconds", elapsed_for_removing);
+
+                            filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
+                            match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
+                                Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                                Err(e) => log::error!("Failed to save PCD file: {}", e),
+                            }
+
+                            //  Voxelization
+                            let start_for_downsampling = std::time::Instant::now();
+                            let voxel_size = 0.2;
+                            let downsampled_points = voxel_downsample(&removed_points, voxel_size);
+                            let elapsed_for_downsampling = start_for_downsampling.elapsed();
+                            log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
+                            log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
+
+                            filename = format!("voxeled/lm/downsampled-{}_laser_map_{}.pcd", voxel_size, msg_count);
+                            match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
+                                Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                                Err(e) => log::error!("Failed to save PCD file: {}", e),
+                            }
+
+                            {
+                                let mut lm_points = gotten_data_lm.lm_points.lock().unwrap();
+                                *lm_points = downsampled_points.clone();
+
+                                log::info!("Updated gotten_data lm_points to {}", lm_points.len());
+                            }
+                        }
+                        None => break,
+                    }
+                    msg_count += 1;
+                }
             }
-            msg_count += 1;
         }
-    }).context("Failed to spawn local task")?;
+    });
 
     // Subscriber for /livox/lidar_3JEDL9M001C1691
     let gotten_data_avia = Arc::clone(&gotten_data);
-    spawner.spawn_local(async move {
+    let mut shutdown_avia = shutdown.resubscribe();
+
+    let avia_handle =  task::spawn(async move {
         let mut msg_count: i32 = 0;
 
         loop {
-            match subsc_avia.next().await {
-                Some(message) => {
-                    let points_num = (message.width * message.height) as usize;
-                    log::debug!("{}: Received /livox/lidar_3JEDL9M001C1691 message", msg_count);
-                    log::debug!("/livox/lidar_3JEDL9M001C1691 points: {}", points_num);
-
-                    // Convert the data from PointCloud2 message to PointXYZ vector
-                    let points = match parse_livox_pointcloud2(&message) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            log::error!("Failed to parse PointCloud2 message: {}", e);
-                            continue;
-                        }
-                    };
-                    
-                    let filename = format!("livox-lidar/lidar_3JEDL9M001C1691_{}.pcd", msg_count);
-                    match save_to_pcd(&points, SAVE_DIR, &filename) {
-                        Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                        Err(e) => log::error!("Failed to save PCD file: {}", e),
-                    }
-
-                    //  Voxelization
-                    let voxel_size = 0.01;
-                    let downsampled_points = voxel_downsample(&points, voxel_size);
-                    log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
-
-                    {
-                        let mut avia_points = gotten_data_avia.avia_points.lock().unwrap();
-                        *avia_points = downsampled_points.clone();
-
-                        log::info!("Updated gotten_data avia_points to {}", avia_points.len());
-                    }
+            tokio::select! {
+                _ = shutdown_avia.recv() => {
+                    log::info!("AVIA subscriber shutting down");
+                    break;
                 }
-                None => break,
-            }
-            msg_count += 1;
-        }
-    }).context("Failed to spawn local task")?;
+                msg = subsc_avia.next() => {
+                    match msg {
+                            Some(message) => {
+                            let points_num = (message.width * message.height) as usize;
+                            log::debug!("{}: Received /livox/lidar_3JEDL9M001C1691 message", msg_count);
+                            log::debug!("/livox/lidar_3JEDL9M001C1691 points: {}", points_num);
 
-    loop {
-        node.spin_once(std::time::Duration::from_millis(10));
-        pool.run_until_stalled();
+                            // Convert the data from PointCloud2 message to PointXYZ vector
+                            let points = match parse_livox_pointcloud2(&message) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::error!("Failed to parse PointCloud2 message: {}", e);
+                                    continue;
+                                }
+                            };
+                            
+                            let filename = format!("livox-lidar/lidar_3JEDL9M001C1691_{}.pcd", msg_count);
+                            match save_to_pcd(&points, SAVE_DIR, &filename) {
+                                Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
+                                Err(e) => log::error!("Failed to save PCD file: {}", e),
+                            }
+
+                            //  Voxelization
+                            let voxel_size = 0.01;
+                            let downsampled_points = voxel_downsample(&points, voxel_size);
+                            log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
+
+                            {
+                                let mut avia_points = gotten_data_avia.avia_points.lock().unwrap();
+                                *avia_points = downsampled_points.clone();
+
+                                log::info!("Updated gotten_data avia_points to {}", avia_points.len());
+                            }
+                        }
+                        None => break,
+                    }
+                    msg_count += 1;
+                }
+            }
+        }
+    });
+
+    let mut node_for_spin = node;
+    let mut shutdown_spin = shutdown.resubscribe();
+
+    let spin_handle =  task::spawn_blocking(move || {
+        loop {
+            node_for_spin.spin_once(std::time::Duration::from_millis(10));
+
+            if shutdown_spin.try_recv().is_ok() {
+                log::info!("Spin loop shutting down");
+                break;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = shutdown.recv() => {
+            log::info!("Shutdown signal received in run_ros_subscribers");
+        }
+        _ = cr_handle => log::info!("CR subscriber finished"),
+        _ = lm_handle => log::info!("LM subscriber finished"),
+        _ = avia_handle => log::info!("AVIA subscriber finished"),
+        _ = spin_handle => log::info!("Spin loop finished"),
     }
 
-    // Ok(())
+    Ok(())
 }
 
 fn parse_livox_pointcloud2(cloud: &PointCloud2) -> Result<Vec<PointXYZ>> {
