@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use pcd_rs::{PcdDeserialize, PcdSerialize, WriterInit};
+use serde::Serialize;
 
-#[derive(Clone, Debug, PcdDeserialize, PcdSerialize)]
+#[derive(Clone, Debug, PcdDeserialize, PcdSerialize, Serialize)]
 pub struct PointXYZ {
     pub x: f32,
     pub y: f32,
