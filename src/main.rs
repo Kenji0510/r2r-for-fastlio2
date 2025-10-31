@@ -148,45 +148,49 @@ async fn run_ros_subscribers(
                             let downsampled_points = voxel_downsample(&points, voxel_size);
                             let elapsed_for_downsampling = start_for_downsampling.elapsed();
                             // log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
-                            log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
+                            // log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
 
                             // filename = format!("voxeled/cr/downsampled-{}_cloud_registered_{}.pcd", voxel_size, msg_count);
                             // match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
                             //     Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
                             //     Err(e) => log::error!("Failed to save PCD file: {}", e),
                             // }
+                            
+                            let elapsed_for_cr = start_for_cr.elapsed();
+                            // log::debug!("Total /cloud_registered processing took: {:.2?} seconds", elapsed_for_cr);
 
-                            {
+                            // Update gotten_data
+                            let snapshot = {
                                 let mut data = gotten_data_cr.lock().unwrap();
                                 data.count += 1;
                                 data.is_cr = true;
                                 data.cr_points_num = downsampled_points.len();
                                 data.cr_points = downsampled_points.clone();
 
-                                log::info!("Updated gotten_data counter to {}", data.count);
+                                log::debug!("=== Serialized PointCloudPacket ===");
+                                log::debug!("count: {}", data.count);
+                                log::debug!("is_cr: {}", data.is_cr);
+                                log::debug!("cr_points length: {}", data.cr_points.len());
+                                log::debug!("cr_points_num: {}", data.cr_points_num);
+                                log::debug!("is_lm: {}", data.is_lm);
+                                log::debug!("lm_points_num: {}", data.lm_points_num);
+                                log::debug!("lm_points length: {}", data.lm_points.len());
+
+                                // log::debug!("Updated gotten_data cr_points to {}", data.cr_points.len());
+                                data.clone()
+                            };
+
+                            if check_and_send_data(&snapshot, &send_tx_cr).await {
+                                log::debug!("Data enqueued for QUIC transmission");
                             }
-                            
-                            let elapsed_for_cr = start_for_cr.elapsed();
-                            log::debug!("Total /cloud_registered processing took: {:.2?} seconds", elapsed_for_cr);
 
-                            // if check_and_send_data(&gotten_data_cr, &send_tx_cr).await {
-                            //     log::debug!("Data enqueued for QUIC transmission");
-                            // }
-
-                            // let grid_size = 0.5;
-                            // let removed_points = match remove_ceiling_points(&points, grid_size) {
-                            //     Ok(p) => p,
-                            //     Err(e) => {
-                            //         log::error!("Failed to remove ceiling points: {}", e);
-                            //         continue;
-                            //     }   
-                            // };
-
-                            // filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
-                            // match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
-                            //     Ok(_) => log::info!("Saved {} points to {}", points.len(), filename),
-                            //     Err(e) => log::error!("Failed to save PCD file: {}", e),
-                            // }
+                            // Reset gotten_data
+                            {
+                                let mut data = gotten_data_cr.lock().unwrap();
+                                data.is_cr = false;
+                                data.is_lm = false;
+                                data.should_send_lm = false;
+                            }
                         }
                         None => break,
                     }
@@ -225,14 +229,14 @@ async fn run_ros_subscribers(
                             let start_for_lm = std::time::Instant::now();
 
                             if msg_count != 5 {                                
-                                let snapshot = {
-                                    let data = gotten_data_lm.lock().unwrap();
-                                    data.clone()
-                                };
+                                // let snapshot = {
+                                //     let data = gotten_data_lm.lock().unwrap();
+                                //     data.clone()
+                                // };
 
-                                if check_and_send_data(&snapshot, &send_tx_lm).await {
-                                    log::debug!("Data enqueued for QUIC transmission");
-                                }
+                                // if check_and_send_data(&snapshot, &send_tx_lm).await {
+                                //     log::debug!("Data enqueued for QUIC transmission");
+                                // }
                                 msg_count += 1;
                                 continue;
                             }
@@ -274,7 +278,7 @@ async fn run_ros_subscribers(
                                 }   
                             };
                             let elapsed_for_removing = start_for_removing.elapsed();
-                            log::debug!("Ceiling removal took: {:.2?} seconds", elapsed_for_removing);
+                            // log::debug!("Ceiling removal took: {:.2?} seconds", elapsed_for_removing);
 
                             // filename = format!("removed-ceiling/removed_ceiling_{}.pcd", msg_count);
                             // match save_to_pcd(&removed_points, SAVE_DIR, &filename) {
@@ -287,8 +291,8 @@ async fn run_ros_subscribers(
                             let voxel_size = 0.2;
                             let downsampled_points = voxel_downsample(&removed_points, voxel_size);
                             let elapsed_for_downsampling = start_for_downsampling.elapsed();
-                            log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
-                            log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
+                            // log::debug!("Points after voxel downsampling: {}", downsampled_points.len());
+                            // log::debug!("Voxel downsampling took: {:.2?} seconds", elapsed_for_downsampling);
 
                             // filename = format!("voxeled/lm/downsampled-{}_laser_map_{}.pcd", voxel_size, msg_count);
                             // match save_to_pcd(&downsampled_points, SAVE_DIR, &filename) {
@@ -297,7 +301,7 @@ async fn run_ros_subscribers(
                             // }
 
                             let elapsed_for_lm = start_for_lm.elapsed();
-                            log::debug!("Total /Laser_map processing took: {:.2?} seconds", elapsed_for_lm);
+                            // log::debug!("Total /Laser_map processing took: {:.2?} seconds", elapsed_for_lm);
 
                             let snapshot = {
                                 let mut data = gotten_data_lm.lock().unwrap();
@@ -306,13 +310,13 @@ async fn run_ros_subscribers(
                                 data.lm_points_num = downsampled_points.len();
                                 data.lm_points = downsampled_points.clone();    
 
-                                log::debug!("Updated gotten_data lm_points to {}", data.lm_points.len());
+                                // log::debug!("Updated gotten_data lm_points to {}", data.lm_points.len());
                                 data.clone()
                             };
 
-                            if check_and_send_data(&snapshot, &send_tx_lm).await {
-                                log::debug!("Data enqueued for QUIC transmission");
-                            }
+                            // if check_and_send_data(&snapshot, &send_tx_lm).await {
+                            //     log::debug!("Data enqueued for QUIC transmission");
+                            // }
                         }
                         None => break,
                     }
